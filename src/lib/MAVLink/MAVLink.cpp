@@ -1,3 +1,4 @@
+#include "MavLuaTransport.h"
 #include "MAVLink.h"
 
 #include "CRSFRouter.h"
@@ -104,6 +105,20 @@ void convert_mavlink_to_crsf_telem(crsf_addr_e destination, uint8_t *CRSFinBuffe
             {
                 continue;
             }
+#if defined(TARGET_TX)
+            if (msg.msgid == MAVLINK_MSG_ID_HEARTBEAT || msg.msgid == MAVLINK_MSG_ID_SYS_STATUS) {
+                mavLuaObserve(msg.msgid, msg.sysid, msg.compid,
+                    reinterpret_cast<const uint8_t *>(_MAV_PAYLOAD(&msg)));
+            }
+            if ((msg.msgid == MAVLINK_MSG_ID_HEARTBEAT || msg.msgid == MAVLINK_MSG_ID_PARAM_VALUE
+                    || msg.msgid == MAVLINK_MSG_ID_AUTOPILOT_VERSION)
+                && !(msg.incompat_flags & MAVLINK_IFLAG_SIGNED)) {
+                uint8_t packet[MAVLINK_MAX_PACKET_LEN];
+                const uint16_t length = mavlink_msg_to_send_buffer(packet, &msg);
+                mavLuaDownlink(msg.msgid, msg.sysid, msg.compid,
+                    reinterpret_cast<const uint8_t *>(_MAV_PAYLOAD(&msg)), packet, length);
+            }
+#endif
             switch (msg.msgid)
             {
             case MAVLINK_MSG_ID_SYS_STATUS: {
