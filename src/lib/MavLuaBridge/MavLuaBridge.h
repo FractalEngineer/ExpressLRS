@@ -16,6 +16,7 @@ private:
     {
         MSG_PING = 4,
         MSG_PARAM_REQUEST_READ = 20,
+        MSG_PARAM_REQUEST_LIST = 21,
         MSG_PARAM_SET = 23,
         MSG_COMMAND_LONG = 76,
     };
@@ -36,12 +37,28 @@ private:
     static constexpr uint32_t READ_GAP_MS = 20;
     static constexpr uint32_t WRITE_GAP_MS = 100;
 
+    // A parameter list session streams the vehicle's own PARAM_VALUE replies without a
+    // per-index reservation. The primary terminator is the handset: it knows the reported
+    // parameter count and closes the session on completion, and the idle gap closes it if
+    // the autopilot stops streaming. These three are backstops, deliberately sized so a
+    // legitimate build cannot trip them, because ArduPilot always restarts a list from
+    // index 0 - a truncated session could not be resumed and would livelock.
+    static constexpr uint32_t LIST_MAX_MS = 300000;
+    static constexpr uint16_t LIST_MAX_PACKETS = 8192;
+    static constexpr uint32_t LIST_IDLE_MS = 3000;
+
     bool active = false;
     bool haveHeartbeat = false;
     bool armed = true;
     bool haveSent = false;
     bool lastWrite = false;
     bool wantVersion = false;
+
+    // Parameter list session state. listActive excludes every other request form.
+    bool listActive = false;
+    uint32_t listAt = 0;
+    uint32_t listSeenAt = 0;
+    uint16_t listCount = 0;
 
     uint32_t leaseAt = 0;
     uint32_t heartbeatAt = 0;
@@ -65,6 +82,57 @@ private:
         wantedName = 0;
     }
 
+    // True while any read reservation is still outstanding and unexpired. Expiry must be
+    // honoured here, or a read that never received a reply would block a list session for
+    // the rest of the lease.
+    bool hasReads(const uint32_t now) const
+    {
+        if (wantedName && uint32_t(now - requestedNameAt) < REQUEST_MS)
+        {
+            return true;
+        }
+        for (unsigned i = 0; i < SLOT_COUNT; ++i)
+        {
+            if (wanted[i] != SLOT_EMPTY && uint32_t(now - requestedAt[i]) < REQUEST_MS)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // True while any read or identity reservation is still outstanding and unexpired.
+    bool busy(const uint32_t now) const
+    {
+        const bool versionPending = wantVersion && uint32_t(now - versionAt) < REQUEST_MS;
+        return versionPending || hasReads(now);
+    }
+
+    // Ends a list session and clears its counters.
+    void closeList()
+    {
+        listActive = false;
+        listCount = 0;
+    }
+
+    // Ends a list session that has hit any of its bounds: duration, packet ceiling,
+    // lease expiry or an idle gap after the autopilot stops streaming.
+    void expireList(const uint32_t now)
+    {
+        if (!listActive)
+        {
+            return;
+        }
+        const bool expired = uint32_t(now - listAt) >= LIST_MAX_MS
+            || listCount >= LIST_MAX_PACKETS
+            || !subscribed(now)
+            || uint32_t(now - listSeenAt) >= LIST_IDLE_MS;
+        if (expired)
+        {
+            closeList();
+        }
+    }
+
     // Returns the MAVLink v1 payload length and CRC_EXTRA seed for an accepted handset
     // message. Unknown IDs are rejected.
     static bool handsetMessage(const uint8_t id, uint8_t &length, uint8_t &crcExtra)
@@ -78,6 +146,10 @@ private:
         case MSG_PARAM_REQUEST_READ:
             length = 20;
             crcExtra = 214;
+            return true;
+        case MSG_PARAM_REQUEST_LIST:
+            length = 2;
+            crcExtra = 159;
             return true;
         case MSG_PARAM_SET:
             length = 23;
@@ -102,6 +174,10 @@ private:
         if (id == MSG_PARAM_SET)
         {
             return 4;
+        }
+        if (id == MSG_PARAM_REQUEST_LIST)
+        {
+            return 0;
         }
         return 30; // COMMAND_LONG
     }
@@ -143,6 +219,7 @@ public:
         wantVersion = false;
         system = 0;
         armed = true;
+        closeList();
         clearReads();
     }
 
@@ -220,6 +297,18 @@ public:
         {
             return 0;
         }
+        // Close an over-long list session before any new request is considered.
+        expireList(now);
+
+        // A list session is the only bounded way to read the vehicle's own parameter
+        // names. It excludes every other request form so the one-reply-per-reservation
+        // guarantee for ordinary reads is never weakened.
+        const bool list = id == MSG_PARAM_REQUEST_LIST;
+        if (listActive ? !list : (list && busy(now)))
+        {
+            return 0;
+        }
+
         const uint32_t gap = (id == MSG_PARAM_SET || lastWrite) ? WRITE_GAP_MS : READ_GAP_MS;
         if (haveSent && uint32_t(now - sentAt) < gap)
         {
@@ -241,7 +330,17 @@ public:
             return 0;
         }
 
-        if (id == MSG_PARAM_REQUEST_READ)
+        if (list)
+        {
+            // Open the bounded window and let the autopilot stream its own parameters.
+            listActive = true;
+            listAt = now;
+            listSeenAt = now;
+            listCount = 0;
+            clearReads();
+            wantVersion = false;
+        }
+        else if (id == MSG_PARAM_REQUEST_READ)
         {
             const uint16_t index = uint16_t(data[0]) | uint16_t(data[1]) << 8;
             if (index == SLOT_EMPTY)
@@ -367,6 +466,31 @@ public:
         if (sys != system)
         {
             return false;
+        }
+
+        // Inside a list session the autopilot streams its own parameters. Forward each
+        // PARAM_VALUE once without a reservation, and close the window as soon as any of
+        // its bounds is reached. Reservations are untouched because a session can only be
+        // opened when none are outstanding.
+        if (listActive)
+        {
+            expireList(now);
+            if (!listActive)
+            {
+                return false;
+            }
+            if (id != 22)
+            {
+                return false;
+            }
+            ++listCount;
+            listSeenAt = now;
+            if (listCount >= LIST_MAX_PACKETS)
+            {
+                listActive = false;
+                listCount = 0;
+            }
+            return true;
         }
 
         if (id == 148 && wantVersion)
