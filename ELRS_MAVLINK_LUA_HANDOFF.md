@@ -1,6 +1,8 @@
 # ELRS MAVLink Lua parameter bridge handoff
 
-Updated: 2026-09-21. Development work; PR [#3779](https://github.com/ExpressLRS/ExpressLRS/pull/3779) is open against `master` as a draft. All of pkendall64's first-pass review comments are addressed and the branch is pushed to the fork. The ladder-window/download path remains abandoned: the agreed replacement is a vehicle-discovered parameter index built over a bounded `PARAM_REQUEST_LIST` session (see "Next work").
+Updated: 2026-09-22. Development work; PR [#3779](https://github.com/ExpressLRS/ExpressLRS/pull/3779) is open against `master` as a draft. All of pkendall64's first-pass review comments are addressed and the branch is pushed to the fork. The ladder-window/download path remains abandoned.
+
+**The vehicle-discovered parameter index also failed on hardware** and must not be treated as the agreed direction. On the Lua side the on-radio build reports `not enough memory for buffer allocation` from around 700 names and sometimes freezes the radio, and no combination of bounded writes, cache preloading, or libraries fixed it. The attempt is archived on the MAV-LUA `self-building-index` branch. The bounded `PARAM_REQUEST_LIST` list session built to serve it is implemented here (see "List session") and passes its native tests, but nothing consumes it yet, so it should be treated as an unproven prerequisite rather than a step towards a working feature. How parameter names are obtained is once again an open question.
 
 ## Current state
 
@@ -58,7 +60,7 @@ Downlink: autopilot -> existing ELRS MAVLink parser -> bridge subscription/targe
 Readiness path: fresh ArduPilot heartbeat -> at most 1 Hz one-shot `MAV_CMD_REQUEST_MESSAGE(SYS_STATUS)` while status is absent/older than two seconds -> normal ELRS converter -> standard CRSF `0xAC` containing big-endian present/enabled/health masks -> the same sole Lua queue consumer. Natural `SYS_STATUS` streaming suppresses requests. This path is independent of parameter subscription.
 
 - CRSF payload is [0, mavlink_packet_length, complete_mavlink_packet...]. Only a single chunk is supported. There is no destination/origin prefix in this payload. The restricted subscription behavior below is this implementation's convention.
-- Uplink uses unsigned MAVLink 1, source system 254 and component 190. Only PING (4, CRC extra 237), PARAM_REQUEST_READ (20, extra 214), and PARAM_SET (23, extra 168) are accepted, with exact payload lengths and valid CRCs. A strict `MAV_CMD_REQUEST_MESSAGE(AUTOPILOT_VERSION)` (76) is also accepted for firmware identity. `PARAM_REQUEST_LIST` (21) is not accepted yet; adding it under a bounded list session is the prerequisite for the vehicle-discovered index.
+- Uplink uses unsigned MAVLink 1, source system 254 and component 190. Only PING (4, CRC extra 237), PARAM_REQUEST_READ (20, extra 214), and PARAM_SET (23, extra 168) are accepted, with exact payload lengths and valid CRCs. A strict `MAV_CMD_REQUEST_MESSAGE(AUTOPILOT_VERSION)` (76) is also accepted for firmware identity. `PARAM_REQUEST_LIST` (21) is also accepted here, but only inside a bounded list session (see "List session"). That session was written to feed a vehicle-discovered index which then failed on radio, so it is currently exercised only by native tests.
 - A PING with all 14 payload bytes zero opens/refreshes a local ten-second subscription. It is not forwarded to the aircraft. Lua sends nothing before explicit Load; a local keepalive runs approximately every three seconds while the loaded Parameters page is visible.
 - The first subscribed ArduPilot HEARTBEAT (autopilot == 3, component 1, nonzero system ID) selects the vehicle. Other system IDs are ignored during that session. Requests must target that system and component 1.
 - The transport operates only in TX_MAVLINK_MODE with connectionState == connected. Otherwise the poll resets the session and clears the handset queue.
@@ -85,7 +87,7 @@ In the separate MAV-LUA repository:
 | tests/test_params.lua | Independent protocol vectors, bounded paging, failure and integrated UI tests. |
 | AGENTS.md | Detailed Lua implementation and release constraints. |
 
-The v0.1.3 release browser reads a fixed-record name file locally: fixed 22-byte category records and 16-byte names, a seek plus at most 128 bytes per name page, and an exact-name read only on ENTER. That pager is reusable, but its packaged name source is superseded by the vehicle-discovered index described under "Next work". The earlier indexed-window download (four outstanding reads, 512-byte block commits, adaptive 40-200 ms spacing, 0.6-2.4 s adaptive timeout, four attempts per index, and the now-removed `fetch.lua`/`store.lua`) is abandoned.
+The v0.1.3 release browser reads a fixed-record name file locally: fixed 22-byte category records and 16-byte names, a seek plus at most 128 bytes per name page, and an exact-name read only on ENTER. That pager is reusable, and its packaged name source is once again the shipped one, because the vehicle-discovered index meant to replace it failed on radio. The earlier indexed-window download (four outstanding reads, 512-byte block commits, adaptive 40-200 ms spacing, 0.6-2.4 s adaptive timeout, four attempts per index, and the now-removed `fetch.lua`/`store.lua`) is abandoned.
 
 crossfireTelemetryPush success only means the radio accepted the frame; it does not acknowledge TX forwarding or autopilot application. FIFO pressure, rate limiting and RF loss can still drop traffic. A write is never automatically repeated after radio acceptance. An unconfirmed save must be inspected by reopening the parameter.
 
@@ -125,21 +127,30 @@ Logs are currently in the Lua checkout at .build/elrs-pipeline-test.log and .bui
 
 ## Pipeline validation and measurements
 
-The Lua loading screen displays observed parameters per second. Idle visible loading callbacks consume up to two parameter frames; key-event and Navigation callbacks retain the one-frame custom-packet budget. No persistent cross-session cache or PARAM_REQUEST_LIST was added at the time of this measurement; the bounded list session described under "Next work" supersedes that ladder-window approach.
+The Lua loading screen displays observed parameters per second. Idle visible loading callbacks consume up to two parameter frames; key-event and Navigation callbacks retain the one-frame custom-packet budget. No persistent cross-session cache or PARAM_REQUEST_LIST was added at the time of this measurement; the bounded list session described under "List session" supersedes that ladder-window approach.
 
 The Lua pipeline test covers delayed/reordered/duplicate replies, loss, congestion, pause/resume, PAGE transitions, aligned block ordering and short-write recovery. Real-core stress includes MAVLink 2 and dense status messages; the current maximum is 8,222 instructions against a 10,000 limit.
 
 On a controlled simulation with a 100 ms round trip and 25 replies/second capacity, 160 records take 8.00 seconds. On Alpha the prior per-record writer reached 6-9 parameters/second but froze after 30-69 records. The aligned block writer has not run on radio.
 
+## List session
+
+The bounded list session is implemented on the `feature/mavlink-lua-parameter-list` branch, which carries it separately from the reviewed PR so the PR stays free of the failed work. It accepts `PARAM_REQUEST_LIST`, forwards streamed `PARAM_VALUE` without a per-index reservation while open, and is hard-capped by time and packet count, lease-gated, and mutually exclusive with normal reads. Native tests cover the session and its packet ceiling, and all seven `test_mavlua` cases pass.
+
+Nothing consumes it. It was built to serve the vehicle-discovered index, which failed on radio, so treat it as an unproven prerequisite: it does what its tests say, but no working feature depends on it.
+
 ## Next work
 
-The ladder-window download is abandoned. Packaged-database browsing is also superseded. The agreed direction is a **vehicle-discovered index**: `PARAM_REQUEST_LIST` streams the vehicle's own parameters once, MAV builds a fixed-record index on SD in bounded runs, and browsing afterwards reads at most eight local records by seek. Names exist only once they have been read from that flight controller, matching Mission Planner.
+**How parameter names are obtained is an open question.** Both previous answers failed on hardware. The ladder-window download froze the radio after 30-69 records. The vehicle-discovered index got further, then reported `not enough memory for buffer allocation` from around 700 names and sometimes froze the radio, and it did so after per-record writes, cache preloading, removal of the `table` library dependency and removal of per-record string padding had all been tried. Do not restart either path without new evidence that the whole operation fits the radio heap.
 
-1. Add a bounded list session to this bridge: accept `PARAM_REQUEST_LIST` and forward streamed `PARAM_VALUE` without a per-index reservation while the session is open. Hard-cap the session by time and packet count, keep it lease-gated, and make it mutually exclusive with normal reads so the one-reply-per-reservation guarantee is never weakened. This is the prerequisite for everything else.
-2. Implement the on-device index builder in MAV-LUA behind an explicit Refresh action: capture to a temporary file, sort in bounded fixed-size runs, emit category records in one sequential pass, rename atomically. Never retain the whole list, never write one record per received parameter, and never reintroduce `params.tmp`.
-3. Report the index identity before parameter traffic and make a never-indexed vehicle say so clearly rather than showing an empty tree.
-4. Run the same sustained soak used for v0.1.3, including a rebuild after link loss mid-download.
-5. Keep firmware changes here and Lua changes in MAV-LUA.
+A useful next step is to stop treating this as a Lua problem and measure the actual ceiling directly: what the radio heap really is, and what the largest single allocation a build requires turns out to be. The host harness in MAV-LUA is not a valid predictor, because it runs under a capped allocator and forcing collection at a tight cap hides accumulated garbage.
+
+Otherwise, the transport boundary remains the sound direction and does not depend on how names are obtained:
+
+1. Keep the bridge generic: accept an explicit set of message IDs and forward payload bytes unchanged, with no autopilot-family interpretation. That is what the reviewed PR already does.
+2. Move firmware identity, database/index selection, reply correlation and wire conversion behind MAV-LUA adapters, so PX4 needs no bridge change.
+3. Keep ArduPilot readiness polling separate from the generic parameter transport.
+4. Add PX4-shaped fixtures proving targeting and raw payloads cross the bridge without an ArduPilot dependency.
 
 Earlier outstanding items, still open:
 
